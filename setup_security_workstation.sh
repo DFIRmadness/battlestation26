@@ -5,7 +5,13 @@
 #
 #  USAGE:   sudo bash setup_security_workstation.sh
 #
-#  ESTIMATED RUNTIME: 2–3 hours (REMnux addon alone ~1 hour)
+#  TIP: Wrap with systemd-inhibit to prevent screen lock / suspend
+#  during the 2–3 hour runtime:
+#    sudo systemd-inhibit \
+#      --what=idle:sleep:handle-lid-switch \
+#      --who="Security Workstation Setup" \
+#      --why="Long-running installation" \
+#      bash setup_security_workstation.sh
 # ============================================================
 #
 #  WHAT THIS SCRIPT INSTALLS (in order):
@@ -57,6 +63,10 @@
 #                                  forensics-all, libyal libs,
 #                                  torbrowser-launcher, all
 #                                  Ubuntu Universe packages
+#                                  NOTE: forensic-artifacts is
+#                                  intentionally removed (Step 17)
+#                                  and superseded by REMnux's
+#                                  artifacts-data package.
 #   snap refresh                → Chromium, OWASP ZAP,
 #                                  John the Ripper (Jumbo Snap)
 #   rustup update               → Rust toolchain + cargo
@@ -781,21 +791,54 @@ CURRENT_STEP=$(( CURRENT_STEP + 1 ))
 progress_bar "${CURRENT_STEP}" "${TOTAL_STEPS}" "ProjectDiscovery Tools"
 log STEP "Step ${CURRENT_STEP}/${TOTAL_STEPS}: ProjectDiscovery Tools"
 
+# install_go_tool IMPORT_PATH [CGO_ENABLED=0|1]
+#   Builds and installs a Go binary, then verifies the binary
+#   landed in $GOPATH/bin.  Retries once on transient failure
+#   (network blip, module cache corruption, etc.)
+#   naabu requires CGO_ENABLED=1 because it links against libpcap.
+#   All other ProjectDiscovery tools are pure Go (CGO_ENABLED=0).
 install_go_tool() {
     local import_path="$1"
+    local cgo="${2:-0}"
     local tool_name; tool_name="$(basename "${import_path}")"
-    run_step "go install ${tool_name}@latest" \
-        su - "${ORIGINAL_USER}" -c \
-            "export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"
-             export GOPATH=\"\$HOME/go\"
-             go install -v ${import_path}@latest"
+
+    local install_cmd
+    install_cmd="export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"
+export GOPATH=\"\$HOME/go\"
+export CGO_ENABLED=${cgo}
+go install -v ${import_path}@latest"
+
+    # First attempt
+    run_step "go install ${tool_name}@latest (CGO=${cgo})" \
+        su - "${ORIGINAL_USER}" -c "${install_cmd}" && {
+        # Verify binary exists after install
+        run_step "Verify ${tool_name} binary exists" \
+            su - "${ORIGINAL_USER}" -c \
+                "export GOPATH=\"\$HOME/go\"
+                 test -x \"\$GOPATH/bin/${tool_name}\" \
+                 && \"\$GOPATH/bin/${tool_name}\" -version 2>/dev/null \
+                 || \"\$GOPATH/bin/${tool_name}\" --version 2>/dev/null \
+                 || echo '${tool_name} binary present'"
+        return 0
+    }
+
+    # Retry once — clear module cache in case it was corrupted
+    log WARN "${tool_name} install failed — clearing module cache and retrying..."
+    su - "${ORIGINAL_USER}" -c \
+        "export PATH=\"\$PATH:/usr/local/go/bin\"
+         export GOPATH=\"\$HOME/go\"
+         go clean -modcache" >> "${LOG_FILE}" 2>&1 || true
+
+    run_step "go install ${tool_name}@latest — RETRY (CGO=${cgo})" \
+        su - "${ORIGINAL_USER}" -c "${install_cmd}"
 }
 
-install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
-install_go_tool "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
-install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"
-install_go_tool "github.com/projectdiscovery/naabu/v2/cmd/naabu"
-install_go_tool "github.com/projectdiscovery/katana/cmd/katana"
+install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"   0
+install_go_tool "github.com/projectdiscovery/subfinder/v2/cmd/subfinder" 0
+install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"        0
+# naabu links against libpcap — requires CGO_ENABLED=1
+install_go_tool "github.com/projectdiscovery/naabu/v2/cmd/naabu"     1
+install_go_tool "github.com/projectdiscovery/katana/cmd/katana"      0
 
 
 # ═════════════════════════════════════════════════════════════
@@ -880,6 +923,19 @@ run_step "Install forensics-all (Ubuntu Universe)" \
 run_step "Install forensics-all-gui (Ubuntu Universe)" \
     apt-get install -y --fix-missing forensics-all-gui
 
+# ── Pre-emptive REMnux conflict fix ──────────────────────────
+# forensics-all pulls in 'forensic-artifacts' (Ubuntu Universe,
+# dated 20230928).  REMnux installs 'artifacts-data' from its
+# own PPA (newer, same upstream dataset) which owns the same
+# file: /usr/share/artifacts/antivirus.yaml.
+# dpkg refuses to unpack artifacts-data while forensic-artifacts
+# is installed, breaking all subsequent apt operations.
+# Removing it now — before REMnux runs — eliminates the conflict
+# entirely.  No data or functionality is lost; artifacts-data
+# contains everything forensic-artifacts had, plus newer entries.
+run_step "Remove forensic-artifacts (superseded by REMnux artifacts-data)" \
+    apt-get remove -y forensic-artifacts
+
 
 # ═════════════════════════════════════════════════════════════
 #  STEP 18 — DFIR FORENSICS LIBRARIES (libyal suite)
@@ -963,6 +1019,47 @@ else
         log INFO "Starting REMnux addon install (~1 hour)..."
         run_step "remnux install --mode=addon" \
             remnux install --mode=addon
+
+        # ── Post-REMnux GNOME restoration ────────────────────────────
+        # REMnux's Salt-based installer replaces a large number of
+        # desktop packages (gnome-shell, gdm3, ubuntu-desktop deps)
+        # with older or different versions.  Without remediation this
+        # causes two symptoms on first reboot:
+        #   1. GDM shows a black screen with a cursor and hangs
+        #   2. "GdmSession: no session desktop files installed" in logs
+        #   3. pam_lastlog.so missing — PAM login stack broken
+        # The fix: reinstall the canonical Ubuntu desktop stack and
+        # PAM modules so the session .desktop files and PAM library
+        # are restored to the correct versions.
+        # This does NOT remove any REMnux tools — it only fixes the
+        # display manager and session infrastructure.
+        log INFO "Restoring GNOME session files and PAM modules post-REMnux..."
+
+        run_step "Reinstall GNOME session infrastructure (post-REMnux)" \
+            apt-get install -y --reinstall \
+                ubuntu-desktop          \
+                gnome-session           \
+                gnome-shell             \
+                gdm3                    \
+                libpam-modules          \
+                libpam-modules-bin      \
+                libpam-runtime
+
+        run_step "Run apt --fix-broken after GNOME reinstall" \
+            apt-get install -y --fix-broken
+
+        run_step "Verify session .desktop files are present" \
+            bash -c 'ls /usr/share/xsessions/*.desktop \
+                        /usr/share/wayland-sessions/*.desktop \
+                        2>/dev/null \
+                     && echo "Session desktop files OK" \
+                     || { echo "WARNING: no session desktop files found"; exit 1; }'
+
+        run_step "Verify pam_lastlog.so is present" \
+            bash -c 'find /lib /usr/lib -name "pam_lastlog.so" 2>/dev/null \
+                     | grep -q pam_lastlog \
+                     && echo "pam_lastlog.so OK" \
+                     || { echo "WARNING: pam_lastlog.so missing"; exit 1; }'
     fi
 
     systemctl start unattended-upgrades 2>/dev/null || true
