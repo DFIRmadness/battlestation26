@@ -306,6 +306,52 @@ MANIFEST
 
 
 # ═════════════════════════════════════════════════════════════
+#  PRE-FLIGHT: BOOTSTRAP CURL + STOP BACKGROUND APT + SCREEN LOCK
+#
+#  1. curl is required by almost every subsequent step — install it
+#     first before anything else uses it.
+#  2. unattended-upgrades and apt-daily timers hold the apt lock and
+#     flood the log with "failed delayed item" warnings.  We stop
+#     them for the duration of the script.
+#  3. Screen lock is disabled immediately so it cannot trigger
+#     during the 2–3 hour install run.
+# ═════════════════════════════════════════════════════════════
+log STEP "Pre-flight: Bootstrap curl, silence background apt, disable screen lock"
+
+log INFO "Bootstrapping curl (required before any download steps)..."
+apt-get update -y -o APT::Update::Error-Mode=any 2>/dev/null || true
+run_step "Bootstrap: curl + ca-certificates + gnupg" \
+    apt-get install -y curl ca-certificates gnupg
+
+log INFO "Stopping unattended-upgrades and apt daily timers..."
+systemctl stop unattended-upgrades 2>/dev/null || true
+systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl kill --kill-who=all apt-daily.service \
+    apt-daily-upgrade.service 2>/dev/null || true
+
+log INFO "Waiting for apt/dpkg locks to clear..."
+for _i in $(seq 1 30); do
+    fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+          /var/cache/apt/archives/lock >/dev/null 2>&1 || break
+    sleep 2
+done
+log INFO "apt locks clear — proceeding."
+
+log INFO "Disabling screen lock (dconf system policy)..."
+install -d -m 0755 /etc/dconf/db/local.d
+tee /etc/dconf/db/local.d/00-screensaver << 'DCONF_EARLY'
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+DCONF_EARLY
+dconf update 2>/dev/null || true
+log INFO "Screen lock disabled."
+
+
+# ═════════════════════════════════════════════════════════════
 #  STEP 1 — SYSTEM UPDATE & PREREQUISITES
 # ═════════════════════════════════════════════════════════════
 CURRENT_STEP=$(( CURRENT_STEP + 1 ))
@@ -368,21 +414,14 @@ done
 run_step "Create /etc/apt/keyrings directory" \
     install -m 0755 -d /etc/apt/keyrings
 
-run_step "Download Docker official GPG key" \
-    bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-             -o /etc/apt/keyrings/docker.asc \
-             && chmod a+r /etc/apt/keyrings/docker.asc'
+run_step "Download Docker official GPG key"     bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg              -o /etc/apt/keyrings/docker.asc              && chmod a+r /etc/apt/keyrings/docker.asc'
 
-run_step "Add Docker stable apt repository" \
-    bash -c '. /etc/os-release
-             echo "deb [arch=$(dpkg --print-architecture) \
-             signed-by=/etc/apt/keyrings/docker.asc] \
-             https://download.docker.com/linux/ubuntu \
-             ${VERSION_CODENAME} stable" \
-             > /etc/apt/sources.list.d/docker.list'
+run_step "Verify Docker GPG key is valid"     bash -c 'gpg --no-default-keyring                  --keyring /etc/apt/keyrings/docker.asc                  --list-keys 2>/dev/null              | grep -qi "docker"              && echo "Docker GPG key OK"              || { echo "Docker GPG key INVALID — re-downloading...";                   rm -f /etc/apt/keyrings/docker.asc;                   curl -fsSL https://download.docker.com/linux/ubuntu/gpg                       -o /etc/apt/keyrings/docker.asc;                   chmod a+r /etc/apt/keyrings/docker.asc;                   gpg --no-default-keyring                       --keyring /etc/apt/keyrings/docker.asc                       --list-keys 2>/dev/null | grep -qi "docker"                   && echo "Docker GPG key OK after retry"                   || { echo "Docker GPG key download FAILED"; exit 1; }; }'
 
-run_step "Update apt after adding Docker repo" \
-    apt-get update -y
+run_step "Add Docker stable apt repository"     bash -c '. /etc/os-release
+             echo "deb [arch=$(dpkg --print-architecture)              signed-by=/etc/apt/keyrings/docker.asc]              https://download.docker.com/linux/ubuntu              ${VERSION_CODENAME} stable"              > /etc/apt/sources.list.d/docker.list'
+
+run_step "Update apt after adding Docker repo"     apt-get update -y
 
 run_step "Install Docker Engine, CLI, and Compose plugin" \
     apt-get install -y \
@@ -1602,6 +1641,17 @@ UPDATE_SCRIPT
 
 chmod 0755 /usr/local/bin/update-workstation
 log SUCCESS "Maintenance script installed: sudo update-workstation"
+
+
+# ─────────────────────────────────────────────────────────────
+#  RE-ENABLE BACKGROUND APT SERVICES
+#  Stopped in pre-flight to prevent apt lock contention.
+#  Safe to restart now that all installs are complete.
+# ─────────────────────────────────────────────────────────────
+log STEP "Post-install: Re-enabling unattended-upgrades and apt daily timers"
+systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl start unattended-upgrades 2>/dev/null || true
+log INFO "Background apt services restored."
 
 
 # ─────────────────────────────────────────────────────────────
