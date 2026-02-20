@@ -833,12 +833,18 @@ go install -v ${import_path}@latest"
         su - "${ORIGINAL_USER}" -c "${install_cmd}"
 }
 
-install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"   0
+# CGO requirements per official ProjectDiscovery documentation:
+#   nuclei   CGO=1 — uses mattn/go-sqlite3 (C library, won't link without CGO)
+#   subfinder CGO=0 — pure Go
+#   httpx    CGO=0 — pure Go
+#   naabu    CGO=1 — links against libpcap (C library)
+#   katana   CGO=1 — official README explicitly requires CGO_ENABLED=1
+#                    (go-rod headless browser uses C bindings)
+install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"       1
 install_go_tool "github.com/projectdiscovery/subfinder/v2/cmd/subfinder" 0
-install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"        0
-# naabu links against libpcap — requires CGO_ENABLED=1
-install_go_tool "github.com/projectdiscovery/naabu/v2/cmd/naabu"     1
-install_go_tool "github.com/projectdiscovery/katana/cmd/katana"      0
+install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"            0
+install_go_tool "github.com/projectdiscovery/naabu/v2/cmd/naabu"         1
+install_go_tool "github.com/projectdiscovery/katana/cmd/katana"          1
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1027,12 +1033,21 @@ else
         # causes two symptoms on first reboot:
         #   1. GDM shows a black screen with a cursor and hangs
         #   2. "GdmSession: no session desktop files installed" in logs
-        #   3. pam_lastlog.so missing — PAM login stack broken
-        # The fix: reinstall the canonical Ubuntu desktop stack and
-        # PAM modules so the session .desktop files and PAM library
-        # are restored to the correct versions.
+        #   3. Noisy PAM errors about pam_lastlog.so in the journal
+        #
+        # The fix has two parts:
+        #   Part A — reinstall the canonical Ubuntu desktop stack so
+        #            the session .desktop files and GDM are restored
+        #            to the correct versions.
+        #   Part B — comment out the stale pam_lastlog.so reference
+        #            in /etc/pam.d/login.  pam_lastlog.so was removed
+        #            from Ubuntu 24.04 noble (shadow 1.5.3 dropped it
+        #            upstream).  REMnux reinstalls older shadow packages
+        #            that still reference it, causing PAM login errors.
+        #            This is the fix Canonical's own SRU applies.
+        #
         # This does NOT remove any REMnux tools — it only fixes the
-        # display manager and session infrastructure.
+        # display manager, session infrastructure, and PAM config.
         log INFO "Restoring GNOME session files and PAM modules post-REMnux..."
 
         run_step "Reinstall GNOME session infrastructure (post-REMnux)" \
@@ -1055,11 +1070,16 @@ else
                      && echo "Session desktop files OK" \
                      || { echo "WARNING: no session desktop files found"; exit 1; }'
 
-        run_step "Verify pam_lastlog.so is present" \
-            bash -c 'find /lib /usr/lib -name "pam_lastlog.so" 2>/dev/null \
-                     | grep -q pam_lastlog \
-                     && echo "pam_lastlog.so OK" \
-                     || { echo "WARNING: pam_lastlog.so missing"; exit 1; }'
+        run_step "Verify pam_lastlog.so reference is removed from PAM config" \
+            bash -c 'sed -i "s/^session.*optional.*pam_lastlog\.so.*/#&  # commented out: pam_lastlog.so removed in Ubuntu 24.04 noble (shadow 1.5.3)/" \
+                     /etc/pam.d/login 2>/dev/null
+                     # Verify the reference is gone or already absent
+                     if grep -q "^session.*pam_lastlog\.so" /etc/pam.d/login 2>/dev/null; then
+                         echo "WARNING: active pam_lastlog.so reference still present"
+                         exit 1
+                     else
+                         echo "pam_lastlog.so PAM config OK (reference absent or commented out)"
+                     fi'
     fi
 
     systemctl start unattended-upgrades 2>/dev/null || true
