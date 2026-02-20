@@ -183,6 +183,34 @@ run_step() {
 
 
 # ═════════════════════════════════════════════════════════════
+#  FATAL STEP RUNNER
+#  Like run_step but exits immediately on failure.
+#  Use for steps where continuing makes no sense — e.g. apt
+#  is broken, Universe repo missing, core packages failed.
+#  The finish() EXIT trap still fires, writing the summary log.
+# ═════════════════════════════════════════════════════════════
+fatal_step() {
+    local description="$1"; shift
+    log INFO "Running: ${description}"
+    if "$@" >> "${LOG_FILE}" 2>&1; then
+        log SUCCESS "${description}"
+        return 0
+    else
+        local rc=$?
+        log ERROR "${description} FAILED (exit ${rc})"
+        log ERROR "━━━ FATAL ERROR — script cannot continue ━━━"
+        log ERROR "Fix the problem above, then re-run the script."
+        ERRORS=$(( ERRORS + 1 ))
+        FAILED_STEPS+=("${description}  ← FATAL")
+        # Restore background apt services before aborting
+        systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        systemctl start unattended-upgrades 2>/dev/null || true
+        exit "${rc}"
+    fi
+}
+
+
+# ═════════════════════════════════════════════════════════════
 #  EXIT HANDLER
 # ═════════════════════════════════════════════════════════════
 finish() {
@@ -320,7 +348,7 @@ log STEP "Pre-flight: Bootstrap curl, silence background apt, disable screen loc
 
 log INFO "Bootstrapping curl (required before any download steps)..."
 apt-get update -y -o APT::Update::Error-Mode=any 2>/dev/null || true
-run_step "Bootstrap: curl + ca-certificates + gnupg" \
+fatal_step "Bootstrap: curl + ca-certificates + gnupg" \
     apt-get install -y curl ca-certificates gnupg
 
 log INFO "Stopping unattended-upgrades and apt daily timers..."
@@ -358,16 +386,16 @@ CURRENT_STEP=$(( CURRENT_STEP + 1 ))
 progress_bar "${CURRENT_STEP}" "${TOTAL_STEPS}" "System Update & Prerequisites"
 log STEP "Step ${CURRENT_STEP}/${TOTAL_STEPS}: System Update & Prerequisites"
 
-run_step "Enable Ubuntu Universe repository" \
+fatal_step "Enable Ubuntu Universe repository" \
     add-apt-repository -y universe
 
-run_step "Update apt package indices" \
+fatal_step "Update apt package indices" \
     apt-get update -y
 
 run_step "Upgrade installed packages" \
     apt-get upgrade -y
 
-run_step "Install prerequisite packages" \
+fatal_step "Install prerequisite packages" \
     apt-get install -y \
         ca-certificates         \
         curl                    \
@@ -381,7 +409,6 @@ run_step "Install prerequisite packages" \
         build-essential         \
         libpcap-dev             \
         libfuse2t64             \
-        fuse                    \
         python3                 \
         python3-pip             \
         python3-setuptools      \
@@ -416,7 +443,9 @@ run_step "Create /etc/apt/keyrings directory" \
 
 run_step "Download Docker official GPG key"     bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg              -o /etc/apt/keyrings/docker.asc              && chmod a+r /etc/apt/keyrings/docker.asc'
 
-run_step "Verify Docker GPG key is valid"     bash -c 'gpg --no-default-keyring                  --keyring /etc/apt/keyrings/docker.asc                  --list-keys 2>/dev/null              | grep -qi "docker"              && echo "Docker GPG key OK"              || { echo "Docker GPG key INVALID — re-downloading...";                   rm -f /etc/apt/keyrings/docker.asc;                   curl -fsSL https://download.docker.com/linux/ubuntu/gpg                       -o /etc/apt/keyrings/docker.asc;                   chmod a+r /etc/apt/keyrings/docker.asc;                   gpg --no-default-keyring                       --keyring /etc/apt/keyrings/docker.asc                       --list-keys 2>/dev/null | grep -qi "docker"                   && echo "Docker GPG key OK after retry"                   || { echo "Docker GPG key download FAILED"; exit 1; }; }'
+# Verify by checking for PGP armor header — if curl got an HTML
+# error page instead of the key, this grep will fail and we retry.
+run_step "Verify Docker GPG key is valid"     bash -c 'grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/apt/keyrings/docker.asc              && echo "Docker GPG key OK"              || { echo "Key missing PGP header — re-downloading...";                   rm -f /etc/apt/keyrings/docker.asc;                   curl -fsSL https://download.docker.com/linux/ubuntu/gpg                       -o /etc/apt/keyrings/docker.asc;                   chmod a+r /etc/apt/keyrings/docker.asc;                   grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/apt/keyrings/docker.asc                   && echo "Docker GPG key OK after retry"                   || { echo "Docker GPG key download FAILED — check network"; exit 1; }; }'
 
 run_step "Add Docker stable apt repository"     bash -c '. /etc/os-release
              echo "deb [arch=$(dpkg --print-architecture)              signed-by=/etc/apt/keyrings/docker.asc]              https://download.docker.com/linux/ubuntu              ${VERSION_CODENAME} stable"              > /etc/apt/sources.list.d/docker.list'
