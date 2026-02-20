@@ -341,7 +341,9 @@ run_step "Install prerequisite packages" \
         python3-setuptools      \
         postgresql              \
         openjdk-21-jre          \
-        snapd
+        snapd                   \
+        open-vm-tools           \
+        open-vm-tools-desktop
 
 
 # ═════════════════════════════════════════════════════════════
@@ -707,7 +709,7 @@ GO_VERSION="$(curl -fsSL 'https://go.dev/dl/?mode=json' \
     | grep -oP '"version":\s*"\Kgo[0-9]+\.[0-9]+(\.[0-9]+)?' \
     | head -1 2>/dev/null)" || true
 if [[ -z "${GO_VERSION}" ]]; then
-    GO_VERSION="go1.24.0"
+    GO_VERSION="go1.24.2"
     log WARN "go.dev API unreachable; falling back to ${GO_VERSION}"
 fi
 
@@ -786,27 +788,54 @@ run_step "Verify Rust installation (rustc + cargo)" \
 #  STEP 14 — PROJECTDISCOVERY TOOLS
 #  https://github.com/projectdiscovery
 #  Updated via: go install <tool>@latest  (update-workstation)
+#
+#  CGO build dependencies required:
+#    nuclei  → mattn/go-sqlite3 needs gcc + libsqlite3-dev
+#    naabu   → links libpcap: gcc + libpcap-dev
+#    katana  → go-rod headless browser: gcc + libpcap-dev
 # ═════════════════════════════════════════════════════════════
 CURRENT_STEP=$(( CURRENT_STEP + 1 ))
 progress_bar "${CURRENT_STEP}" "${TOTAL_STEPS}" "ProjectDiscovery Tools"
 log STEP "Step ${CURRENT_STEP}/${TOTAL_STEPS}: ProjectDiscovery Tools"
 
-# install_go_tool IMPORT_PATH [CGO_ENABLED=0|1]
+run_step "Install CGO build dependencies for ProjectDiscovery tools" \
+    apt-get install -y \
+        gcc             \
+        g++             \
+        make            \
+        libsqlite3-dev  \
+        libpcap-dev     \
+        pkg-config
+
+# install_go_tool IMPORT_PATH [CGO_ENABLED=0|1] [LDFLAGS=""]
 #   Builds and installs a Go binary, then verifies the binary
 #   landed in $GOPATH/bin.  Retries once on transient failure
 #   (network blip, module cache corruption, etc.)
-#   naabu requires CGO_ENABLED=1 because it links against libpcap.
-#   All other ProjectDiscovery tools are pure Go (CGO_ENABLED=0).
+#
+#   nuclei  CGO=1  LDFLAGS="-checklinkname=0"
+#           mattn/go-sqlite3 requires CGO.
+#           bytedance/sonic v1.14.x (nuclei dep) is broken on Go 1.24.0
+#           and certain later versions — sonic uses internal Go runtime
+#           symbols that were removed.  The official workaround from
+#           sonic's README is -ldflags="-checklinkname=0" which tells
+#           the linker to skip the linkname validation checks.
+#   naabu   CGO=1  — links against libpcap (C library)
+#   katana  CGO=1  — official README explicitly requires CGO_ENABLED=1
+#                    (go-rod headless browser uses C bindings)
 install_go_tool() {
     local import_path="$1"
     local cgo="${2:-0}"
+    local ldflags="${3:-}"
     local tool_name; tool_name="$(basename "${import_path}")"
+
+    local ldflag_arg=""
+    [[ -n "${ldflags}" ]] && ldflag_arg="-ldflags='${ldflags}'"
 
     local install_cmd
     install_cmd="export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"
 export GOPATH=\"\$HOME/go\"
 export CGO_ENABLED=${cgo}
-go install -v ${import_path}@latest"
+go install -v ${ldflag_arg} ${import_path}@latest"
 
     # First attempt
     run_step "go install ${tool_name}@latest (CGO=${cgo})" \
@@ -834,12 +863,13 @@ go install -v ${import_path}@latest"
 }
 
 # CGO requirements per official ProjectDiscovery documentation:
-#   nuclei   CGO=1 — uses mattn/go-sqlite3 (C library, won't link without CGO)
+#   nuclei   CGO=1 — uses mattn/go-sqlite3 (C library)
+#            Requires Go >= 1.24.2 (Go 1.24.0 is broken due to
+#            bytedance/sonic GoMapIterator compile error)
 #   subfinder CGO=0 — pure Go
 #   httpx    CGO=0 — pure Go
 #   naabu    CGO=1 — links against libpcap (C library)
-#   katana   CGO=1 — official README explicitly requires CGO_ENABLED=1
-#                    (go-rod headless browser uses C bindings)
+#   katana   CGO=1 — go-rod headless browser uses C bindings
 install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"       1
 install_go_tool "github.com/projectdiscovery/subfinder/v2/cmd/subfinder" 0
 install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"            0
@@ -1313,6 +1343,69 @@ if [[ -d /data ]]; then
     run_step "Set /data group ownership → ${ORIGINAL_USER}" \
         chown root:"${ORIGINAL_USER}" /data
 fi
+
+
+# ═════════════════════════════════════════════════════════════
+#  POST-INSTALL: REMOVE SIFT "TEXT TOO SMALL" MESSAGE
+#
+#  SIFT's saltstack writes this line into /etc/bash.bashrc:
+#    echo -e "\n\033[1;36mTEXT TOO SMALL? ..."
+#  It appears in every new shell/TTY after install.
+#  We don't want it — remove it with a targeted sed in-place edit.
+# ═════════════════════════════════════════════════════════════
+log STEP "Post-install: Remove SIFT 'TEXT TOO SMALL' message from /etc/bash.bashrc"
+
+run_step "Remove SIFT TEXT TOO SMALL line from /etc/bash.bashrc" \
+    bash -c 'if grep -q "TEXT TOO SMALL" /etc/bash.bashrc 2>/dev/null; then
+                 cp /etc/bash.bashrc /etc/bash.bashrc.pre-sift-cleanup
+                 sed -i "/TEXT TOO SMALL/d" /etc/bash.bashrc
+                 echo "Line removed. Backup: /etc/bash.bashrc.pre-sift-cleanup"
+             else
+                 echo "TEXT TOO SMALL line not present — nothing to do"
+             fi'
+
+
+# ═════════════════════════════════════════════════════════════
+#  POST-INSTALL: DISABLE SCREEN LOCK (set to Never)
+#
+#  The screen lock caused the password field to become unusable
+#  during the 2–3 hour install run.  We disable it system-wide
+#  via the dconf system profile (/etc/dconf/db/local.d/) which:
+#    - Takes effect immediately after 'dconf update' (no reboot)
+#    - Persists across reboots
+#    - Applies to all users on this machine
+#    - Can be re-enabled by the user via Settings → Privacy →
+#      Screen Lock, OR by running:
+#        sudo rm /etc/dconf/db/local.d/00-screensaver
+#        sudo dconf update
+#
+#  NOTE: This sets screen lock to NEVER and idle-delay to 0.
+#  Re-enable if this machine is in a shared or public environment.
+# ═════════════════════════════════════════════════════════════
+log STEP "Post-install: Disabling screen lock (set to Never)"
+
+run_step "Create /etc/dconf/db/local.d directory" \
+    install -d -m 0755 /etc/dconf/db/local.d
+
+run_step "Write dconf screen lock policy (00-screensaver)" \
+    tee /etc/dconf/db/local.d/00-screensaver << 'DCONF_SCREENSAVER'
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+DCONF_SCREENSAVER
+
+run_step "Apply dconf policy (dconf update)" \
+    dconf update
+
+log WARN "╔══════════════════════════════════════════════════════════╗"
+log WARN "║  SCREEN LOCK HAS BEEN SET TO NEVER                      ║"
+log WARN "║  This prevents interruption during long tool runs.      ║"
+log WARN "║  To re-enable: Settings → Privacy → Screen Lock         ║"
+log WARN "║  Or run:  sudo rm /etc/dconf/db/local.d/00-screensaver  ║"
+log WARN "║           sudo dconf update                              ║"
+log WARN "╚══════════════════════════════════════════════════════════╝"
 
 
 # ═════════════════════════════════════════════════════════════
