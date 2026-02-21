@@ -785,16 +785,21 @@ GO_TARBALL="${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TARBALL}"
 log INFO "Installing ${GO_VERSION} (${GO_ARCH})..."
 
-run_step "Download Go ${GO_VERSION} tarball" \
-    curl -fsSL -o "/tmp/${GO_TARBALL}" "${GO_URL}"
+fatal_step "Download Go ${GO_VERSION} tarball" \
+    curl -fsSL --retry 3 --retry-delay 5 \
+         -o "/tmp/${GO_TARBALL}" "${GO_URL}"
 
-run_step "Remove any previous /usr/local/go installation" \
+fatal_step "Remove any previous /usr/local/go installation" \
     rm -rf /usr/local/go
 
-run_step "Extract Go to /usr/local" \
+fatal_step "Extract Go ${GO_VERSION} to /usr/local" \
     tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
 
 rm -f "/tmp/${GO_TARBALL}"
+
+# Export PATH into the running script process so subsequent
+# steps (go install etc.) can find the go binary immediately.
+export PATH="$PATH:/usr/local/go/bin"
 
 # Write golang.sh at outer shell level — no > /dev/null
 run_step "Write /etc/profile.d/golang.sh (system-wide PATH)" \
@@ -819,6 +824,8 @@ fi
 
 run_step "Verify Go installation" \
     /usr/local/go/bin/go version
+
+
 
 
 # ═════════════════════════════════════════════════════════════
@@ -930,15 +937,44 @@ go install -v ${ldflag_arg} ${import_path}@latest"
         su - "${ORIGINAL_USER}" -c "${install_cmd}"
 }
 
-# CGO requirements per official ProjectDiscovery documentation:
-#   nuclei   CGO=1 — uses mattn/go-sqlite3 (C library)
-#            Requires Go >= 1.24.2 (Go 1.24.0 is broken due to
-#            bytedance/sonic GoMapIterator compile error)
+# ── Nuclei: prebuilt binary from GitHub releases ────────────
+# nuclei vendors bytedance/sonic v1.14.x which uses internal Go
+# runtime symbols (GoMapIterator) removed from Go 1.24.x.
+# This is a *compile-time* error — no flag workaround exists.
+# ProjectDiscovery's prebuilt binaries use their own controlled
+# Go environment and are not affected.
+#
+# URL pattern: nuclei_VERSION_linux_amd64.zip  (version in name)
+# We fetch the tag from the GitHub API, then build the URL.
+# Installed to ~/go/bin so it sits alongside the other PD tools.
+log INFO "Installing nuclei from prebuilt GitHub release binary..."
+NUCLEI_BIN_DIR="${ORIGINAL_HOME}/go/bin"
+install -d -m 0755 "${NUCLEI_BIN_DIR}"
+
+NUCLEI_TAG=""
+NUCLEI_TAG="$(curl -fsSL     https://api.github.com/repos/projectdiscovery/nuclei/releases/latest     | grep '"tag_name"' | head -1 | cut -d'"' -f4)" || true
+
+if [[ -z "${NUCLEI_TAG}" ]]; then
+    log WARN "GitHub API unreachable — skipping nuclei; install manually:"
+    log WARN "  https://github.com/projectdiscovery/nuclei/releases/latest"
+else
+    NUCLEI_VER="${NUCLEI_TAG#v}"   # strip leading 'v' from tag
+    NUCLEI_ZIP="nuclei_${NUCLEI_VER}_linux_amd64.zip"
+    NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/${NUCLEI_TAG}/${NUCLEI_ZIP}"
+    log INFO "Downloading nuclei ${NUCLEI_TAG} from ${NUCLEI_URL}..."
+
+    if run_step "Download nuclei ${NUCLEI_TAG} prebuilt binary"             curl -fsSL -o "/tmp/${NUCLEI_ZIP}" "${NUCLEI_URL}"; then
+        run_step "Install nuclei binary → ${NUCLEI_BIN_DIR}"             bash -c "cd /tmp                      && unzip -o '${NUCLEI_ZIP}' nuclei                      && mv /tmp/nuclei '${NUCLEI_BIN_DIR}/nuclei'                      && chmod 0755 '${NUCLEI_BIN_DIR}/nuclei'                      && chown '${ORIGINAL_USER}:${ORIGINAL_USER}'                             '${NUCLEI_BIN_DIR}/nuclei'                      && rm -f '/tmp/${NUCLEI_ZIP}'"
+        run_step "Verify nuclei binary"             su - "${ORIGINAL_USER}" -c                 'export PATH="$PATH:$HOME/go/bin"; nuclei -version'
+    fi
+fi
+
+# ── Remaining ProjectDiscovery tools: go install ─────────────
+# CGO requirements:
 #   subfinder CGO=0 — pure Go
 #   httpx    CGO=0 — pure Go
 #   naabu    CGO=1 — links against libpcap (C library)
 #   katana   CGO=1 — go-rod headless browser uses C bindings
-install_go_tool "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"       1
 install_go_tool "github.com/projectdiscovery/subfinder/v2/cmd/subfinder" 0
 install_go_tool "github.com/projectdiscovery/httpx/cmd/httpx"            0
 install_go_tool "github.com/projectdiscovery/naabu/v2/cmd/naabu"         1
