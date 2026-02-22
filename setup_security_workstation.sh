@@ -906,6 +906,13 @@ install_go_tool() {
     local ldflag_arg=""
     [[ -n "${ldflags}" ]] && ldflag_arg="-ldflags='${ldflags}'"
 
+    # Ensure $HOME/go is owned by the user, not root.
+    # The script runs as root so earlier steps may have created this
+    # directory as root — causing "permission denied" when su - user
+    # tries to write the module cache.
+    install -d -m 0755 "${ORIGINAL_HOME}/go"
+    chown "${ORIGINAL_USER}:${ORIGINAL_USER}" "${ORIGINAL_HOME}/go"
+
     local install_cmd
     install_cmd="export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"
 export GOPATH=\"\$HOME/go\"
